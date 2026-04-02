@@ -71,7 +71,6 @@ public class VersionDetector {
     static final String FILE_PROTOCOL = "file";
     static final String CFT_URL = "https://googlechromelabs.github.io/chrome-for-testing/";
     static final int MIN_CHROMEDRIVER_IN_CFT = 115;
-    static final String VERSION_DETECTION_REGEX = "[^\\d^\\.]";
     static final String WMIC = "wmic";
     static final String POWERSHELL = "powershell";
     static final String REG_QUERY = "reg query";
@@ -144,7 +143,7 @@ public class VersionDetector {
                     }
                     return Optional.of(fileteredList
                             .get(fileteredList.size() - 1).version);
-                } else if (!driverVersion.isPresent()) {
+                } else if (!driverVersion.isPresent() || isNullOrEmpty(driverVersion.get())) {
                     // Parse JSON using LastGoodVersions
                     cftUrl = config.getChromeLastGoodVersionsUrl();
 
@@ -460,12 +459,8 @@ public class VersionDetector {
         }
     }
 
-    public static String parseVersion(String version) {
-        return version.replaceAll(VERSION_DETECTION_REGEX, "");
-    }
-
     public static boolean isCfT(String driverVersion) {
-        return isNullOrEmpty(driverVersion) || Integer.parseInt(
+        return !isNullOrEmpty(driverVersion) && Integer.parseInt(
                 VersionDetector.getMajorVersion(driverVersion)) >= MIN_CHROMEDRIVER_IN_CFT;
     }
 
