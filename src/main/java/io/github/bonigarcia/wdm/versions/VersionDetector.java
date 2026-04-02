@@ -160,7 +160,7 @@ public class VersionDetector {
                     driverUrl = new URL(CFT_URL);
                 } catch (MalformedURLException e1) {
                     log.error("Exception creating CfT URL {}: {}", CFT_URL,
-                            e.getMessage());
+                            e1.getMessage());
                 }
                 if (!driverVersion.isPresent()) {
                     versionLabel += "_STABLE";
