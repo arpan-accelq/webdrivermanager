@@ -30,12 +30,14 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.StringReader;
+import java.net.MalformedURLException;
 import java.net.URL;
 import java.nio.charset.Charset;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Collections;
+import java.util.Enumeration;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
@@ -67,6 +69,12 @@ public class VersionDetector {
     static final String VERSIONS_PROPERTIES = "versions.properties";
     static final String COMMANDS_PROPERTIES = "commands.properties";
     static final String FILE_PROTOCOL = "file";
+    static final String CFT_URL = "https://googlechromelabs.github.io/chrome-for-testing/";
+    static final int MIN_CHROMEDRIVER_IN_CFT = 115;
+    static final String VERSION_DETECTION_REGEX = "[^\\d^\\.]";
+    static final String WMIC = "wmic";
+    static final String POWERSHELL = "powershell";
+    static final String REG_QUERY = "reg query";
 
     final Logger log = getLogger(lookup().lookupClass());
 
@@ -118,8 +126,7 @@ public class VersionDetector {
         if (driverName.equalsIgnoreCase("chromedriver")) {
             String cftUrl = null;
             try {
-                if (driverVersion.isPresent()
-                        && Integer.parseInt(driverVersion.get()) >= 115) {
+                if (driverVersion.isPresent() && isCfT(driverVersion.get())) {
                     // Parse JSON using GoodVersions
                     cftUrl = config.getChromeGoodVersionsUrl();
 
@@ -130,6 +137,11 @@ public class VersionDetector {
                                     .startsWith(driverVersion.get()))
                             .collect(toList());
 
+                    if (fileteredList.isEmpty()) {
+                        throw new IllegalStateException(
+                                "No CfT entry found for Chrome version "
+                                        + driverVersion.get());
+                    }
                     return Optional.of(fileteredList
                             .get(fileteredList.size() - 1).version);
                 } else if (!driverVersion.isPresent()) {
@@ -142,8 +154,18 @@ public class VersionDetector {
                     return Optional.of(versions.channels.stable.version);
                 }
             } catch (Exception e) {
-                log.warn("Exception reading {} to get version of {} ({})",
+                log.warn(
+                        "Exception reading CfT URL ('{}') to get version of {} ({})",
                         cftUrl, driverName, e.getMessage());
+                try {
+                    driverUrl = new URL(CFT_URL);
+                } catch (MalformedURLException e1) {
+                    log.error("Exception creating CfT URL {}: {}", CFT_URL,
+                            e.getMessage());
+                }
+                if (!driverVersion.isPresent()) {
+                    versionLabel += "_STABLE";
+                }
             }
 
         }
@@ -152,21 +174,31 @@ public class VersionDetector {
         String url = driverVersion.isPresent()
                 ? driverUrl + latestLabel + "_" + driverVersion.get() + osLabel
                 : driverUrl + versionLabel;
-        Optional<String> result = Optional.empty();
-        try (InputStream response = httpClient
-                .execute(httpClient.createHttpGet(new URL(url))).getEntity()
-                .getContent()) {
-            result = Optional.of(IOUtils.toString(response, versionCharset)
-                    .replace("\r\n", ""));
-        } catch (Exception e) {
-            log.warn("Exception reading {} to get latest version of {} ({})",
-                    url, driverName, e.getMessage());
-        }
+        Optional<String> result = readUrlContent(url, driverName,
+                versionCharset);
         if (result.isPresent()) {
             log.debug("Latest version of {} according to {} is {}", driverName,
                     url, result.get());
         }
 
+        return result;
+    }
+
+    public Optional<String> readUrlContent(String url, String driverName,
+            Charset versionCharset) {
+        Optional<String> result = Optional.empty();
+        try (InputStream response = httpClient
+                .execute(httpClient.createHttpGet(new URL(url))).getEntity()
+                .getContent()) {
+            result = Optional.of(IOUtils
+                    .toString(response,
+                            (versionCharset != null ? versionCharset
+                                    : Charset.defaultCharset()).name())
+                    .replace("\r\n", ""));
+        } catch (Exception e) {
+            log.warn("Exception reading {} to get latest version of {} ({})",
+                    url, driverName, e.getMessage());
+        }
         return result;
     }
 
@@ -190,15 +222,17 @@ public class VersionDetector {
             OperatingSystem operatingSystem = config.getOperatingSystem();
             switch (operatingSystem) {
             case WIN:
-                if (command.toLowerCase(ROOT).contains("wmic")) {
-                    File wmicLocation = findFileLocation("wmic.exe");
+                if (command.toLowerCase(ROOT).contains(WMIC)) {
                     String newCommand = command.replace("Version", "Caption");
-                    String captionOutput = runAndWait(wmicLocation,
-                            newCommand.split(" "));
-                    int iCaption = captionOutput.indexOf("=");
+                    String output = runCommandInShell(newCommand);
+                    int iCaption = output.indexOf("=");
                     if (iCaption != -1) {
-                        pathStr = captionOutput.substring(iCaption + 1);
+                        pathStr = output.substring(iCaption + 1);
                     }
+                } else if (command.toLowerCase(ROOT).contains(POWERSHELL)) {
+                    String newCommand = command.replace("ProductVersion",
+                            "FileName");
+                    pathStr = runCommandInShell(newCommand);
                 }
                 break;
 
@@ -284,20 +318,33 @@ public class VersionDetector {
     protected List<String> getCommandsList(String browserName,
             Properties commandsProperties) {
         OperatingSystem operatingSystem = config.getOperatingSystem();
-        return Collections.list(commandsProperties.keys()).stream()
-                .map(Object::toString).filter(s -> s.contains(browserName))
+        List<String> commandsList = Collections.list(commandsProperties.keys())
+                .stream().map(Object::toString)
+                .filter(s -> s.contains(browserName))
                 .filter(operatingSystem::matchOs).sorted()
                 .collect(Collectors.toList());
+        if (operatingSystem.isWin()) {
+            Collections.reverse(commandsList);
+        }
+        return commandsList;
     }
 
-    protected Optional<String> getBrowserVersionUsingCommand(String command) {
+    protected String runCommandInShell(String command) {
         String commandLowerCase = command.toLowerCase(ROOT);
-        boolean isWmic = commandLowerCase.contains("wmic");
-        boolean isRegQuery = commandLowerCase.contains("reg query");
+        boolean isWmic = commandLowerCase.contains(WMIC);
+        boolean isRegQuery = commandLowerCase.contains(REG_QUERY);
+        boolean isPowerShell = commandLowerCase.contains(POWERSHELL);
         int lastSpaceIndex = command.lastIndexOf(" ");
 
         String[] commandArray;
-        if (!isWmic && !isRegQuery && lastSpaceIndex != -1) {
+        if (isPowerShell) {
+            // Split into: {"powershell.exe", "-Command", "<expression>"}
+            int firstSpaceIndex = command.indexOf(" ");
+            int secondSpaceIndex = command.indexOf(" ", firstSpaceIndex + 1);
+            commandArray = new String[] { command.substring(0, firstSpaceIndex),
+                    command.substring(firstSpaceIndex + 1, secondSpaceIndex),
+                    command.substring(secondSpaceIndex + 1) };
+        } else if (!isWmic && !isRegQuery && lastSpaceIndex != -1) {
             // For non-windows (wmic or reg query), the command is splitted into
             // two parts: {"browserPath", "--version"}
             commandArray = new String[] { command.substring(0, lastSpaceIndex),
@@ -306,26 +353,29 @@ public class VersionDetector {
             commandArray = command.split(" ");
         }
 
-        String browserVersionOutput;
+        String output;
         if (isWmic) {
-            File wmicLocation = findFileLocation("wmic.exe");
-            browserVersionOutput = runAndWait(wmicLocation, commandArray);
+            File wmicLocation = findFileLocation(WMIC + ".exe");
+            output = runAndWait(wmicLocation, commandArray);
         } else {
-            browserVersionOutput = runAndWait(commandArray);
+            output = runAndWait(commandArray);
         }
 
+        return output;
+    }
+
+    protected Optional<String> getBrowserVersionUsingCommand(String command) {
+        String browserVersionOutput = runCommandInShell(command);
         if (!isNullOrEmpty(browserVersionOutput)) {
             if (browserVersionOutput.toLowerCase(ROOT).contains("snap")) {
                 isSnap = true;
             }
-
             String parsedBrowserVersion = browserVersionOutput
                     .replaceAll(config.getBrowserVersionDetectionRegex(), "");
             log.trace("Detected browser version is {}", parsedBrowserVersion);
 
             return Optional.of(getMajorVersion(parsedBrowserVersion));
         } else {
-
             return empty();
         }
     }
@@ -339,8 +389,9 @@ public class VersionDetector {
             try (InputStream inputStream = getVersionsInputStream(
                     propertiesName, online)) {
                 properties = new Properties();
-                properties.load(new StringReader(IOUtils
-                        .toString(inputStream, UTF_8).replace("\\", "\\\\")));
+                properties.load(new StringReader(
+                        IOUtils.toString(inputStream, UTF_8.name())
+                                .replace("\\", "\\\\")));
                 propertiesMap.put(propertiesName, properties);
             } catch (Exception e) {
                 throw new IllegalStateException("Cannot read " + propertiesName,
@@ -401,8 +452,21 @@ public class VersionDetector {
     }
 
     public static String getMajorVersion(String version) {
-        int i = version.indexOf('.');
-        return i != -1 ? version.substring(0, i) : version;
+        if (version != null) {
+            int i = version.indexOf('.');
+            return i != -1 ? version.substring(0, i) : version;
+        } else {
+            return "0";
+        }
+    }
+
+    public static String parseVersion(String version) {
+        return version.replaceAll(VERSION_DETECTION_REGEX, "");
+    }
+
+    public static boolean isCfT(String driverVersion) {
+        return isNullOrEmpty(driverVersion) || Integer.parseInt(
+                VersionDetector.getMajorVersion(driverVersion)) >= MIN_CHROMEDRIVER_IN_CFT;
     }
 
     protected File findFileLocation(String filename) {
